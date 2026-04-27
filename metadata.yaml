@@ -1,0 +1,6 @@
+name: astrbot_plugin_roleplay
+desc: "角色扮演插件 v1.0 — 随机场景·身份·外貌·关系，AI伴侣来演。插件出数据，AI出灵魂。设计叶枔枖，编写叶克宝。"
+version: "1.0.0"
+author: "叶枔枖 & 叶克宝"
+repo: "https://github.com/yussica1016/astrbot_plugin_roleplay"
+license: "AGPL-3.0"
