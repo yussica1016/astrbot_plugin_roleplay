@@ -47,7 +47,10 @@ class RoleplayPlugin(Star):
                     return json.load(f)
             except (json.JSONDecodeError, IOError):
                 pass
-        return {"player_gender": None, "current": None, "saves": []}
+        return {"player_gender": None, "current": None, "saves": [], "custom": {
+            "scenes": {}, "identities_m": {}, "identities_f": {},
+            "relationships": [],
+        }}
 
     def _save(self):
         try:
@@ -87,6 +90,42 @@ class RoleplayPlugin(Star):
     def _fill_ta(self, text: str) -> str:
         """替换模板中的{ta}"""
         return text.replace("{ta}", "ta")
+
+    def _ensure_custom(self):
+        """确保custom字段存在"""
+        if "custom" not in self.data:
+            self.data["custom"] = {
+                "scenes": {}, "identities_m": {}, "identities_f": {},
+                "relationships": [],
+            }
+
+    def _get_all_worlds(self) -> list:
+        """获取所有世界观名（默认+自定义）"""
+        self._ensure_custom()
+        worlds = set(WORLDS.keys())
+        for key in ["scenes", "identities_m", "identities_f"]:
+            worlds.update(self.data["custom"].get(key, {}).keys())
+        return sorted(worlds)
+
+    def _get_scenes(self, world_name: str) -> list:
+        """获取指定世界观的场景（默认+自定义）"""
+        self._ensure_custom()
+        scenes = list(WORLDS.get(world_name, {}).get("scenes", []))
+        scenes += self.data["custom"].get("scenes", {}).get(world_name, [])
+        return scenes
+
+    def _get_identities(self, world_name: str, gender: str) -> list:
+        """获取指定世界观和性别的身份（默认+自定义）"""
+        self._ensure_custom()
+        key = f"identities_{gender}"
+        ids = list(WORLDS.get(world_name, {}).get(key, []))
+        ids += self.data["custom"].get(key, {}).get(world_name, [])
+        return ids
+
+    def _get_relationships(self) -> list:
+        """获取所有关系（默认+自定义）"""
+        self._ensure_custom()
+        return RELATIONSHIPS + self.data["custom"].get("relationships", [])
 
     # ═══════════════════════════════════════
     #  /角色设定 男/女
@@ -141,15 +180,15 @@ class RoleplayPlugin(Star):
         style = parts[1].strip() if len(parts) > 1 else None
 
         # 选择世界观
-        if style and style in WORLDS:
+        all_worlds = self._get_all_worlds()
+        if style and style in all_worlds:
             world_name = style
         elif style:
-            # 模糊匹配
-            matches = [w for w in WORLDS if style in w]
+            matches = [w for w in all_worlds if style in w]
             if matches:
                 world_name = random.choice(matches)
             else:
-                available = "、".join(WORLDS.keys())
+                available = "、".join(all_worlds)
                 yield event.plain_result(
                     f"⚠️ 找不到「{style}」风格\n"
                     f"可选：{available}\n"
@@ -157,25 +196,35 @@ class RoleplayPlugin(Star):
                 )
                 return
         else:
-            world_name = random.choice(list(WORLDS.keys()))
+            world_name = random.choice(all_worlds)
 
-        world = WORLDS[world_name]
         player_gender = self.data["player_gender"]
 
-        # 分配身份：玩家和AI角色
-        if player_gender == "男":
-            player_id = random.choice(world["identities_m"])
-            ai_id = random.choice(world["identities_f"])
-        else:
-            player_id = random.choice(world["identities_f"])
-            ai_id = random.choice(world["identities_m"])
+        # 获取合并后的数据
+        scenes = self._get_scenes(world_name)
+        if not scenes:
+            yield event.plain_result(f"⚠️ 「{world_name}」还没有场景，先用「自定义 场景 {world_name} 描述」添加")
+            return
+
+        p_gender = "m" if player_gender == "男" else "f"
+        a_gender = "f" if player_gender == "男" else "m"
+        player_ids = self._get_identities(world_name, p_gender)
+        ai_ids = self._get_identities(world_name, a_gender)
+
+        if not player_ids or not ai_ids:
+            yield event.plain_result(f"⚠️ 「{world_name}」缺少角色身份，先用「自定义 身份」添加")
+            return
+
+        # 分配身份
+        player_id = random.choice(player_ids)
+        ai_id = random.choice(ai_ids)
 
         # 生成外貌（给AI角色）
         ai_appearance = self._gen_appearance()
 
         # 关系和场景
-        relationship = random.choice(RELATIONSHIPS)
-        scene = random.choice(world["scenes"])
+        relationship = random.choice(self._get_relationships())
+        scene = random.choice(scenes)
 
         # 开场白
         opening = self._fill_ta(random.choice(OPENINGS))
@@ -292,10 +341,9 @@ class RoleplayPlugin(Star):
             yield event.plain_result("⚠️ 还没有进行中的角色扮演")
             return
 
-        world = WORLDS[cur["world"]]
-        # 排除当前场景
-        other_scenes = [s for s in world["scenes"] if s != cur["scene"]]
-        new_scene = random.choice(other_scenes) if other_scenes else random.choice(world["scenes"])
+        world_scenes = self._get_scenes(cur["world"])
+        other_scenes = [s for s in world_scenes if s != cur["scene"]]
+        new_scene = random.choice(other_scenes) if other_scenes else random.choice(world_scenes)
 
         cur["scene"] = new_scene
         cur["history"].append({"type": "换场景", "content": new_scene})
@@ -435,3 +483,225 @@ class RoleplayPlugin(Star):
             f"继续你们的故事吧 💬",
         ]
         yield event.plain_result("\n".join(lines))
+
+    # ═══════════════════════════════════════
+    #  /自定义 ...
+    # ═══════════════════════════════════════
+
+    @filter.command("自定义")
+    async def custom_add(self, event: AstrMessageEvent):
+        """
+        /自定义 场景 世界观 描述
+        /自定义 身份 世界观 男/女 描述
+        /自定义 关系 描述
+        /自定义 世界观 名称
+        /自定义 查看
+        """
+        if not self._check_perm(event):
+            return
+
+        self._ensure_custom()
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+
+        if len(parts) < 2:
+            yield event.plain_result(
+                "✏️ 自定义用法\n"
+                "━" * 22 + "\n"
+                "自定义 场景 世界观 描述\n"
+                "  例：自定义 场景 古风 月下桃花林，花瓣落满石桌\n\n"
+                "自定义 身份 世界观 男/女 描述\n"
+                "  例：自定义 身份 现代 女 深夜电台主播，声音很好听\n\n"
+                "自定义 关系 描述\n"
+                "  例：自定义 关系 失忆后重逢的恋人\n\n"
+                "自定义 世界观 名称\n"
+                "  例：自定义 世界观 赛博朋克\n\n"
+                "自定义 查看 → 查看所有自定义内容\n"
+                "删自定义 序号 → 删除"
+            )
+            return
+
+        rest = parts[1]
+        sub_parts = rest.split(maxsplit=1)
+        action = sub_parts[0]
+
+        # ── 查看 ──
+        if action == "查看":
+            custom = self.data["custom"]
+            lines = ["✏️ 自定义内容", "━" * 22]
+
+            idx = 1
+            has_content = False
+
+            for world, scene_list in custom.get("scenes", {}).items():
+                for s in scene_list:
+                    lines.append(f"{idx}. [场景·{world}] {s}")
+                    idx += 1
+                    has_content = True
+
+            for world, id_list in custom.get("identities_m", {}).items():
+                for s in id_list:
+                    lines.append(f"{idx}. [身份·{world}·男] {s}")
+                    idx += 1
+                    has_content = True
+
+            for world, id_list in custom.get("identities_f", {}).items():
+                for s in id_list:
+                    lines.append(f"{idx}. [身份·{world}·女] {s}")
+                    idx += 1
+                    has_content = True
+
+            for r in custom.get("relationships", []):
+                lines.append(f"{idx}. [关系] {r}")
+                idx += 1
+                has_content = True
+
+            if not has_content:
+                lines.append("（空）")
+
+            lines.append("━" * 22)
+            if has_content:
+                lines.append("删除：删自定义 序号")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 添加世界观 ──
+        if action == "世界观":
+            args = rest.split(maxsplit=1)
+            if len(args) < 2:
+                yield event.plain_result("✏️ 格式：自定义 世界观 名称")
+                return
+            name = args[1].strip()
+            for key in ["scenes", "identities_m", "identities_f"]:
+                if name not in self.data["custom"][key]:
+                    self.data["custom"][key][name] = []
+            self._save()
+            yield event.plain_result(
+                f"✅ 已创建世界观「{name}」\n"
+                f"现在可以添加场景和身份：\n"
+                f"自定义 场景 {name} 描述\n"
+                f"自定义 身份 {name} 男/女 描述"
+            )
+            return
+
+        # ── 添加场景 ──
+        if action == "场景":
+            args = rest.split(maxsplit=2)
+            if len(args) < 3:
+                yield event.plain_result("✏️ 格式：自定义 场景 世界观 描述")
+                return
+            world = args[1]
+            desc = args[2]
+            scenes = self.data["custom"].setdefault("scenes", {})
+            scenes.setdefault(world, []).append(desc)
+            self._save()
+            yield event.plain_result(f"✅ 已添加场景到「{world}」：\n{desc}")
+            return
+
+        # ── 添加身份 ──
+        if action == "身份":
+            args = rest.split(maxsplit=3)
+            if len(args) < 4 or args[2] not in ("男", "女"):
+                yield event.plain_result("✏️ 格式：自定义 身份 世界观 男/女 描述")
+                return
+            world = args[1]
+            gender = "m" if args[2] == "男" else "f"
+            desc = args[3]
+            key = f"identities_{gender}"
+            ids = self.data["custom"].setdefault(key, {})
+            ids.setdefault(world, []).append(desc)
+            self._save()
+            yield event.plain_result(f"✅ 已添加{args[2]}性身份到「{world}」：\n{desc}")
+            return
+
+        # ── 添加关系 ──
+        if action == "关系":
+            args = rest.split(maxsplit=1)
+            if len(args) < 2:
+                yield event.plain_result("✏️ 格式：自定义 关系 描述")
+                return
+            desc = args[1]
+            self.data["custom"].setdefault("relationships", []).append(desc)
+            self._save()
+            yield event.plain_result(f"✅ 已添加关系：\n{desc}")
+            return
+
+        yield event.plain_result(
+            "⚠️ 未知类型，可选：场景、身份、关系、世界观、查看"
+        )
+
+    # ═══════════════════════════════════════
+    #  /删自定义 序号
+    # ═══════════════════════════════════════
+
+    @filter.command("删自定义")
+    async def custom_delete(self, event: AstrMessageEvent):
+        """删除自定义内容（序号从「自定义 查看」获取）"""
+        if not self._check_perm(event):
+            return
+
+        self._ensure_custom()
+        msg = event.message_str.strip()
+        parts = msg.split()
+
+        if len(parts) < 2:
+            yield event.plain_result("✏️ 格式：删自定义 序号\n先发「自定义 查看」获取序号")
+            return
+
+        try:
+            target = int(parts[1])
+            if target < 1:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("⚠️ 序号必须是正整数")
+            return
+
+        custom = self.data["custom"]
+        idx = 1
+
+        for world in list(custom.get("scenes", {}).keys()):
+            scene_list = custom["scenes"][world]
+            for i, s in enumerate(scene_list):
+                if idx == target:
+                    scene_list.pop(i)
+                    if not scene_list:
+                        del custom["scenes"][world]
+                    self._save()
+                    yield event.plain_result(f"🗑️ 已删除场景：{s}")
+                    return
+                idx += 1
+
+        for world in list(custom.get("identities_m", {}).keys()):
+            id_list = custom["identities_m"][world]
+            for i, s in enumerate(id_list):
+                if idx == target:
+                    id_list.pop(i)
+                    if not id_list:
+                        del custom["identities_m"][world]
+                    self._save()
+                    yield event.plain_result(f"🗑️ 已删除身份：{s}")
+                    return
+                idx += 1
+
+        for world in list(custom.get("identities_f", {}).keys()):
+            id_list = custom["identities_f"][world]
+            for i, s in enumerate(id_list):
+                if idx == target:
+                    id_list.pop(i)
+                    if not id_list:
+                        del custom["identities_f"][world]
+                    self._save()
+                    yield event.plain_result(f"🗑️ 已删除身份：{s}")
+                    return
+                idx += 1
+
+        rels = custom.get("relationships", [])
+        for i, r in enumerate(rels):
+            if idx == target:
+                rels.pop(i)
+                self._save()
+                yield event.plain_result(f"🗑️ 已删除关系：{r}")
+                return
+            idx += 1
+
+        yield event.plain_result("⚠️ 序号不存在")
