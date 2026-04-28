@@ -31,9 +31,13 @@ MSK = timezone(timedelta(hours=3))
 class RoleplayPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "roleplay_data.json"
+        # 数据文件放在 plugin_data 目录，避免 _save() 写入插件目录触发热重载死循环
+        self.data_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "plugin_data", "astrbot_plugin_roleplay"
         )
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.data_path = os.path.join(self.data_dir, "roleplay_data.json")
         self.data = self._load()
 
     # ═══════════════════════════════════════
@@ -41,6 +45,17 @@ class RoleplayPlugin(Star):
     # ═══════════════════════════════════════
 
     def _load(self) -> dict:
+        # 先检查旧路径，迁移到新位置
+        old_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "roleplay_data.json"
+        )
+        if os.path.exists(old_path) and not os.path.exists(self.data_path):
+            try:
+                os.rename(old_path, self.data_path)
+                logger.info(f"数据已从 {old_path} 迁移到 {self.data_path}")
+            except OSError:
+                pass
+
         if os.path.exists(self.data_path):
             try:
                 with open(self.data_path, "r", encoding="utf-8") as f:
